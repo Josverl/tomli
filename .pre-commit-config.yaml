@@ -28,11 +28,11 @@ repos:
     files: '^src/.+\.py$'
     args: ['--never', '--application-directories', 'src']
 - repo: https://github.com/PyCQA/isort
-  rev: 3459bdee0962449aad91235273c3fd1306dfebe5  # frozen: 8.0.0
+  rev: a333737ed43df02b18e6c95477ea1b285b3de15a  # frozen: 8.0.1
   hooks:
   - id: isort
 - repo: https://github.com/psf/black-pre-commit-mirror
-  rev: ea488cebbfd88a5f50b8bd95d5c829d0bb76feb8  # frozen: 26.1.0
+  rev: fa505ab9c3e0fedafe1709fd7ac2b5f8996c670d  # frozen: 26.3.1
   hooks:
   - id: black
 - repo: https://github.com/pre-commit/pre-commit-hooks
