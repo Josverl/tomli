@@ -1,0 +1,15 @@
+{
+  "urls": [
+    ["tomli/__init__.py", "src/tomli/__init__.py"],
+    ["tomli/_parser.py", "src/tomli/_parser.py"],
+    ["tomli/_re.py", "src/tomli/_re.py"],
+    ["tomli/_types.py", "src/tomli/_types.py"]
+  ],
+  "deps": [
+    ["datetime", "latest"],
+    ["functools", "latest"],
+    ["pathlib", "latest"],
+    ["github:josverl/micropython-stubs/mip/typing_mpy.json", "main"]
+  ],
+  "version": "2.4.0"
+}
