@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from ._types import ParseFloat
 
 RE_VERBOSE = getattr(re, "VERBOSE", 0)
+RE_HAS_VERBOSE = hasattr(re, "VERBOSE")
 
 _DECIMAL_DIGITS: Final = frozenset("0123456789")
 _HEX_DIGITS: Final = frozenset("0123456789abcdefABCDEF")
@@ -142,7 +143,77 @@ class _NumberRegexFallback:
         return _match_number_fallback(src, pos)
 
 
+class _LocaltimeMatchFallback:
+    def __init__(self, end_pos: int, groups: tuple[str | None, ...]):
+        self._end_pos = end_pos
+        self._groups = groups
+
+    def groups(self) -> tuple[str | None, ...]:
+        return self._groups
+
+    def end(self) -> int:
+        return self._end_pos
+
+
+def _parse_2digit_time_part(src: str, pos: int) -> tuple[int | None, int]:
+    if pos + 2 > len(src):
+        return None, pos
+    s = src[pos : pos + 2]
+    if not ("0" <= s[0] <= "9" and "0" <= s[1] <= "9"):
+        return None, pos
+    return int(s), pos + 2
+
+
+def _match_localtime_fallback(src: str, pos: int = 0) -> _LocaltimeMatchFallback | None:
+    hour, i = _parse_2digit_time_part(src, pos)
+    if hour is None or hour > 23:
+        return None
+    if i >= len(src) or src[i] != ":":
+        return None
+    i += 1
+
+    minute, i = _parse_2digit_time_part(src, i)
+    if minute is None or minute > 59:
+        return None
+
+    sec_str: str | None = None
+    micros_str: str | None = None
+
+    if i < len(src) and src[i] == ":":
+        i += 1
+        second, i = _parse_2digit_time_part(src, i)
+        if second is None or second > 59:
+            return None
+        sec_str = src[i - 2 : i]
+
+        if i < len(src) and src[i] == ".":
+            i += 1
+            frac_start = i
+            while i < len(src) and "0" <= src[i] <= "9":
+                i += 1
+            if i == frac_start:
+                return None
+            micros_str = src[frac_start:i][:6]
+
+    return _LocaltimeMatchFallback(
+        i,
+        (
+            src[pos : pos + 2],
+            src[pos + 3 : pos + 5],
+            sec_str,
+            micros_str,
+        ),
+    )
+
+
+class _LocaltimeRegexFallback:
+    def match(self, src: str, pos: int = 0) -> _LocaltimeMatchFallback | None:
+        return _match_localtime_fallback(src, pos)
+
+
 try:
+    if not RE_HAS_VERBOSE:
+        raise ValueError("verbose regex unsupported")
     _re_number = re.compile(
         r"""
 0
@@ -168,11 +239,11 @@ except ValueError:
 RE_NUMBER: Final = _re_number
 
 try:
+    if not RE_HAS_VERBOSE:
+        raise ValueError("verbose regex unsupported")
     _re_localtime = re.compile(_TIME_RE_STR, RE_VERBOSE)
 except ValueError:
-    _re_localtime = re.compile(
-        r"([0-9][0-9]):([0-9][0-9])(?::([0-9][0-9])(?:\.([0-9]{1,6})[0-9]*)?)?"
-    )
+    _re_localtime = _LocaltimeRegexFallback()
 RE_LOCALTIME: Final = _re_localtime
 
 
@@ -192,6 +263,12 @@ def _all_digits(s: str) -> bool:
     return bool(s) and all("0" <= c <= "9" for c in s)
 
 
+def _pad_right_zeros(s: str, width: int) -> str:
+    if len(s) >= width:
+        return s
+    return s + ("0" * (width - len(s)))
+
+
 def _match_datetime_fallback(src: str, pos: int = 0) -> _DatetimeMatchFallback | None:
     if pos + 10 > len(src):
         return None
@@ -209,7 +286,7 @@ def _match_datetime_fallback(src: str, pos: int = 0) -> _DatetimeMatchFallback |
         return None
 
     i = pos + 10
-    if i >= len(src) or src[i] not in "Tt ":
+    if i >= len(src):
         return _DatetimeMatchFallback(
             i,
             (
@@ -227,7 +304,46 @@ def _match_datetime_fallback(src: str, pos: int = 0) -> _DatetimeMatchFallback |
             ),
         )
 
-    i += 1
+    # Time part is optional. Parse it only when a valid separator+time token
+    # starts here; otherwise keep this as a date-only value.
+    if src[i] in "Tt":
+        i += 1
+    elif src[i] == " ":
+        if not (i + 6 <= len(src) and _all_digits(src[i + 1 : i + 3]) and src[i + 3 : i + 4] == ":"):
+            return _DatetimeMatchFallback(
+                i,
+                (
+                    year_str,
+                    month_str,
+                    day_str,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+        i += 1
+    else:
+        return _DatetimeMatchFallback(
+            i,
+            (
+                year_str,
+                month_str,
+                day_str,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
     if i + 5 > len(src):
         return None
     hour_str = src[i : i + 2]
@@ -238,6 +354,8 @@ def _match_datetime_fallback(src: str, pos: int = 0) -> _DatetimeMatchFallback |
     minute_str = src[i : i + 2]
     i += 2
     if not _all_digits(hour_str) or not _all_digits(minute_str):
+        return None
+    if int(hour_str) > 23 or int(minute_str) > 59:
         return None
 
     sec_str: str | None = None
@@ -250,6 +368,8 @@ def _match_datetime_fallback(src: str, pos: int = 0) -> _DatetimeMatchFallback |
         i += 2
         if not _all_digits(sec_str):
             return None
+        if int(sec_str) > 59:
+            return None
         if src[i : i + 1] == ".":
             i += 1
             frac_start = i
@@ -257,7 +377,7 @@ def _match_datetime_fallback(src: str, pos: int = 0) -> _DatetimeMatchFallback |
                 i += 1
             if i == frac_start:
                 return None
-            micros_str = src[frac_start : frac_start + 6]
+            micros_str = src[frac_start:i][:6]
 
     zulu_time: str | None = None
     offset_sign_str: str | None = None
@@ -280,6 +400,8 @@ def _match_datetime_fallback(src: str, pos: int = 0) -> _DatetimeMatchFallback |
         offset_minute_str = src[i : i + 2]
         i += 2
         if not _all_digits(offset_hour_str) or not _all_digits(offset_minute_str):
+            return None
+        if int(offset_hour_str) > 23 or int(offset_minute_str) > 59:
             return None
 
     return _DatetimeMatchFallback(
@@ -306,6 +428,8 @@ class _DatetimeRegexFallback:
 
 
 try:
+    if not RE_HAS_VERBOSE:
+        raise ValueError("verbose regex unsupported")
     _re_datetime = re.compile(
         rf"""
 ([0-9]{{4}})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])  # date, e.g. 1988-10-27
@@ -351,7 +475,7 @@ def match_to_datetime(match: Any) -> datetime | date:
         return date(year, month, day)
     hour, minute = int(hour_str), int(minute_str)
     sec = int(sec_str) if sec_str else 0
-    micros = int(micros_str.ljust(6, "0")) if micros_str else 0
+    micros = int(_pad_right_zeros(micros_str, 6)) if micros_str else 0
     if offset_sign_str:
         tz: tzinfo | None = cached_tz(
             offset_hour_str, offset_minute_str, offset_sign_str
@@ -386,7 +510,7 @@ def match_to_localtime(match: Any) -> time:
         sec_str = match.group(3)
         micros_str = match.group(4)
     sec = int(sec_str) if sec_str else 0
-    micros = int(micros_str.ljust(6, "0")) if micros_str else 0
+    micros = int(_pad_right_zeros(micros_str, 6)) if micros_str else 0
     return time(int(hour_str), int(minute_str), sec, micros)
 
 

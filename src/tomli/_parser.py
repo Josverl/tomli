@@ -352,6 +352,12 @@ def skip_until(
         while src[pos] not in error_on:
             pos += 1
         raise TOMLDecodeError(f"Found invalid character {src[pos]!r}", src, pos)
+
+    # TOML permits only Unicode scalar values. Reject surrogate code points
+    # even when they appear in comments or literal strings.
+    for i, ch in enumerate(src[pos:new_pos], pos):
+        if not is_unicode_scalar_value(ord(ch)):
+            raise TOMLDecodeError(f"Found invalid character {ch!r}", src, i)
     return new_pos
 
 
