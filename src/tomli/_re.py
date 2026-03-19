@@ -5,14 +5,24 @@
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone, tzinfo
-from functools import lru_cache
 import re
+
+try:
+    from functools import lru_cache as compat_lru_cache  # type: ignore[assignment]
+except ImportError:
+    def compat_lru_cache(maxsize=None):
+        def decorator(func):
+            return func
+
+        return decorator
 
 TYPE_CHECKING = False
 if TYPE_CHECKING:
     from typing import Any, Final
 
     from ._types import ParseFloat
+
+RE_VERBOSE = getattr(re, "VERBOSE", 0)
 
 _TIME_RE_STR: Final = r"""
 ([01][0-9]|2[0-3])             # hours
@@ -23,8 +33,11 @@ _TIME_RE_STR: Final = r"""
 )?
 """
 
-RE_NUMBER: Final = re.compile(
-    r"""
+_RE_NUMBER_HAS_FLOATPART = True
+
+try:
+    _re_number = re.compile(
+        r"""
 0
 (?:
     x[0-9A-Fa-f](?:_?[0-9A-Fa-f])*   # hex
@@ -40,11 +53,156 @@ RE_NUMBER: Final = re.compile(
     (?:[eE][+-]?[0-9](?:_?[0-9])*)?  # optional exponent part
 )
 """,
-    flags=re.VERBOSE,
-)
-RE_LOCALTIME: Final = re.compile(_TIME_RE_STR, flags=re.VERBOSE)
-RE_DATETIME: Final = re.compile(
-    rf"""
+        RE_VERBOSE,
+    )
+except ValueError:
+    _RE_NUMBER_HAS_FLOATPART = False
+    _re_number = re.compile(
+        r"[+-]?(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|0[oO][0-7]+|[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"
+    )
+RE_NUMBER: Final = _re_number
+
+try:
+    _re_localtime = re.compile(_TIME_RE_STR, RE_VERBOSE)
+except ValueError:
+    _re_localtime = re.compile(
+        r"([0-9][0-9]):([0-9][0-9])(?::([0-9][0-9])(?:\.([0-9]{1,6})[0-9]*)?)?"
+    )
+RE_LOCALTIME: Final = _re_localtime
+
+
+class _DatetimeMatchFallback:
+    def __init__(self, end_pos: int, groups: tuple[str | None, ...]):
+        self._end_pos = end_pos
+        self._groups = groups
+
+    def groups(self) -> tuple[str | None, ...]:
+        return self._groups
+
+    def end(self) -> int:
+        return self._end_pos
+
+
+def _all_digits(s: str) -> bool:
+    return bool(s) and all("0" <= c <= "9" for c in s)
+
+
+def _match_datetime_fallback(src: str, pos: int = 0) -> _DatetimeMatchFallback | None:
+    if pos + 10 > len(src):
+        return None
+
+    year_str = src[pos : pos + 4]
+    month_str = src[pos + 5 : pos + 7]
+    day_str = src[pos + 8 : pos + 10]
+    if (
+        src[pos + 4 : pos + 5] != "-"
+        or src[pos + 7 : pos + 8] != "-"
+        or not _all_digits(year_str)
+        or not _all_digits(month_str)
+        or not _all_digits(day_str)
+    ):
+        return None
+
+    i = pos + 10
+    if i >= len(src) or src[i] not in "Tt ":
+        return _DatetimeMatchFallback(
+            i,
+            (
+                year_str,
+                month_str,
+                day_str,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+
+    i += 1
+    if i + 5 > len(src):
+        return None
+    hour_str = src[i : i + 2]
+    i += 2
+    if src[i : i + 1] != ":":
+        return None
+    i += 1
+    minute_str = src[i : i + 2]
+    i += 2
+    if not _all_digits(hour_str) or not _all_digits(minute_str):
+        return None
+
+    sec_str: str | None = None
+    micros_str: str | None = None
+    if src[i : i + 1] == ":":
+        i += 1
+        if i + 2 > len(src):
+            return None
+        sec_str = src[i : i + 2]
+        i += 2
+        if not _all_digits(sec_str):
+            return None
+        if src[i : i + 1] == ".":
+            i += 1
+            frac_start = i
+            while i < len(src) and "0" <= src[i] <= "9":
+                i += 1
+            if i == frac_start:
+                return None
+            micros_str = src[frac_start : frac_start + 6]
+
+    zulu_time: str | None = None
+    offset_sign_str: str | None = None
+    offset_hour_str: str | None = None
+    offset_minute_str: str | None = None
+
+    if i < len(src) and src[i] in "Zz":
+        zulu_time = src[i]
+        i += 1
+    elif i < len(src) and src[i] in "+-":
+        offset_sign_str = src[i]
+        i += 1
+        if i + 5 > len(src):
+            return None
+        offset_hour_str = src[i : i + 2]
+        i += 2
+        if src[i : i + 1] != ":":
+            return None
+        i += 1
+        offset_minute_str = src[i : i + 2]
+        i += 2
+        if not _all_digits(offset_hour_str) or not _all_digits(offset_minute_str):
+            return None
+
+    return _DatetimeMatchFallback(
+        i,
+        (
+            year_str,
+            month_str,
+            day_str,
+            hour_str,
+            minute_str,
+            sec_str,
+            micros_str,
+            zulu_time,
+            offset_sign_str,
+            offset_hour_str,
+            offset_minute_str,
+        ),
+    )
+
+
+class _DatetimeRegexFallback:
+    def match(self, src: str, pos: int = 0) -> _DatetimeMatchFallback | None:
+        return _match_datetime_fallback(src, pos)
+
+
+try:
+    _re_datetime = re.compile(
+        rf"""
 ([0-9]{{4}})-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])  # date, e.g. 1988-10-27
 (?:
     [Tt ]
@@ -52,16 +210,24 @@ RE_DATETIME: Final = re.compile(
     (?:([Zz])|([+-])([01][0-9]|2[0-3]):([0-5][0-9]))?  # optional time offset
 )?
 """,
-    flags=re.VERBOSE,
-)
+        RE_VERBOSE,
+    )
+except ValueError:
+    _re_datetime = _DatetimeRegexFallback()
+RE_DATETIME: Final = _re_datetime
 
 
-def match_to_datetime(match: re.Match[str]) -> datetime | date:
+def match_to_datetime(match: Any) -> datetime | date:
     """Convert a `RE_DATETIME` match to `datetime.datetime` or `datetime.date`.
 
     Raises ValueError if the match does not correspond to a valid date
     or datetime.
     """
+    try:
+        groups = match.groups()
+    except AttributeError:
+        groups = tuple(match.group(i) for i in range(1, 12))
+
     (
         year_str,
         month_str,
@@ -74,7 +240,7 @@ def match_to_datetime(match: re.Match[str]) -> datetime | date:
         offset_sign_str,
         offset_hour_str,
         offset_minute_str,
-    ) = match.groups()
+    ) = groups
     year, month, day = int(year_str), int(month_str), int(day_str)
     if hour_str is None:
         return date(year, month, day)
@@ -95,7 +261,7 @@ def match_to_datetime(match: re.Match[str]) -> datetime | date:
 # No need to limit cache size. This is only ever called on input
 # that matched RE_DATETIME, so there is an implicit bound of
 # 24 (hours) * 60 (minutes) * 2 (offset direction) = 2880.
-@lru_cache(maxsize=None)
+@compat_lru_cache(maxsize=None)
 def cached_tz(hour_str: str, minute_str: str, sign_str: str) -> timezone:
     sign = 1 if sign_str == "+" else -1
     return timezone(
@@ -106,14 +272,26 @@ def cached_tz(hour_str: str, minute_str: str, sign_str: str) -> timezone:
     )
 
 
-def match_to_localtime(match: re.Match[str]) -> time:
-    hour_str, minute_str, sec_str, micros_str = match.groups()
+def match_to_localtime(match: Any) -> time:
+    try:
+        hour_str, minute_str, sec_str, micros_str = match.groups()
+    except AttributeError:
+        hour_str = match.group(1)
+        minute_str = match.group(2)
+        sec_str = match.group(3)
+        micros_str = match.group(4)
     sec = int(sec_str) if sec_str else 0
     micros = int(micros_str.ljust(6, "0")) if micros_str else 0
     return time(int(hour_str), int(minute_str), sec, micros)
 
 
-def match_to_number(match: re.Match[str], parse_float: ParseFloat) -> Any:
-    if match.group("floatpart"):
-        return parse_float(match.group())
-    return int(match.group(), 0)
+def match_to_number(match: Any, parse_float: ParseFloat) -> Any:
+    num_str = match.group(0)
+    if _RE_NUMBER_HAS_FLOATPART:
+        if match.group("floatpart"):
+            return parse_float(num_str)
+        return int(num_str, 0)
+
+    if "." in num_str or "e" in num_str or "E" in num_str:
+        return parse_float(num_str)
+    return int(num_str, 0)

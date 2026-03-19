@@ -5,7 +5,11 @@
 from __future__ import annotations
 
 import sys
-from types import MappingProxyType
+try:
+    from types import MappingProxyType
+except ImportError:
+    # MicroPython doesn't have types.MappingProxyType
+    MappingProxyType = dict  # type: ignore[assignment]
 
 from ._re import (
     RE_DATETIME,
@@ -32,7 +36,12 @@ if TYPE_CHECKING:
 # Choosing `sys.getrecursionlimit()` as maximum inline table/array nesting
 # level, as it allows more nesting than pure Python, but still seems a far
 # lower number than where mypyc binaries crash.
-MAX_INLINE_NESTING: Final = sys.getrecursionlimit()
+_get_recursion_limit = getattr(sys, "getrecursionlimit", None)
+if _get_recursion_limit is None:
+    _max_inline_nesting = 1000
+else:
+    _max_inline_nesting = _get_recursion_limit()
+MAX_INLINE_NESTING: Final = _max_inline_nesting
 
 ASCII_CTRL: Final = frozenset(chr(i) for i in range(32)) | frozenset(chr(127))
 
@@ -106,12 +115,12 @@ class TOMLDecodeError(ValueError):
                 stacklevel=2,
             )
             if pos is not DEPRECATED_DEFAULT:
-                args = pos, *args
+                args = (pos,) + args
             if doc is not DEPRECATED_DEFAULT:
-                args = doc, *args
+                args = (doc,) + args
             if msg is not DEPRECATED_DEFAULT:
-                args = msg, *args
-            ValueError.__init__(self, *args)
+                args = (msg,) + args
+            super().__init__(*args)
             return
 
         lineno = doc.count("\n", 0, pos) + 1
@@ -125,7 +134,7 @@ class TOMLDecodeError(ValueError):
         else:
             coord_repr = f"line {lineno}, column {colno}"
         errmsg = f"{msg} (at {coord_repr})"
-        ValueError.__init__(self, errmsg)
+        super().__init__(errmsg)
 
         self.msg = msg
         self.doc = doc
@@ -681,6 +690,13 @@ def parse_basic_str(src: str, pos: Pos, *, multiline: bool) -> tuple[Pos, str]:
         pos += 1
 
 
+def regex_match_end(match: Any, pos: Pos) -> Pos:
+    end = getattr(match, "end", None)
+    if end is not None:
+        return end()
+    return pos + len(match.group(0))
+
+
 def parse_value(
     src: str, pos: Pos, parse_float: ParseFloat, nest_lvl: int
 ) -> tuple[Pos, Any]:
@@ -734,17 +750,17 @@ def parse_value(
             datetime_obj = match_to_datetime(datetime_match)
         except ValueError as e:
             raise TOMLDecodeError("Invalid date or datetime", src, pos) from e
-        return datetime_match.end(), datetime_obj
+        return regex_match_end(datetime_match, pos), datetime_obj
     localtime_match = RE_LOCALTIME.match(src, pos)
     if localtime_match:
-        return localtime_match.end(), match_to_localtime(localtime_match)
+        return regex_match_end(localtime_match, pos), match_to_localtime(localtime_match)
 
     # Integers and "normal" floats.
     # The regex will greedily match any type starting with a decimal
     # char, so needs to be located after handling of dates and times.
     number_match = RE_NUMBER.match(src, pos)
     if number_match:
-        return number_match.end(), match_to_number(number_match, parse_float)
+        return regex_match_end(number_match, pos), match_to_number(number_match, parse_float)
 
     # Special floats
     first_three = src[pos : pos + 3]
