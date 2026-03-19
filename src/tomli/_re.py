@@ -24,6 +24,11 @@ if TYPE_CHECKING:
 
 RE_VERBOSE = getattr(re, "VERBOSE", 0)
 
+_DECIMAL_DIGITS: Final = frozenset("0123456789")
+_HEX_DIGITS: Final = frozenset("0123456789abcdefABCDEF")
+_OCTAL_DIGITS: Final = frozenset("01234567")
+_BINARY_DIGITS: Final = frozenset("01")
+
 _TIME_RE_STR: Final = r"""
 ([01][0-9]|2[0-3])             # hours
 :([0-5][0-9])                  # minutes
@@ -34,6 +39,108 @@ _TIME_RE_STR: Final = r"""
 """
 
 _RE_NUMBER_HAS_FLOATPART = True
+
+
+class _NumberMatchFallback:
+    def __init__(self, text: str, has_floatpart: bool, end_pos: int):
+        self._text = text
+        self._has_floatpart = has_floatpart
+        self._end_pos = end_pos
+
+    def group(self, idx=0):
+        if idx == 0:
+            return self._text
+        if idx == "floatpart":
+            return "x" if self._has_floatpart else ""
+        raise IndexError("invalid group")
+
+    def end(self) -> int:
+        return self._end_pos
+
+
+def _scan_digits_with_underscores(
+    src: str, pos: int, allowed: frozenset[str]
+) -> int | None:
+    if pos >= len(src) or src[pos] not in allowed:
+        return None
+
+    i = pos + 1
+    while i < len(src):
+        char = src[i]
+        if char in allowed:
+            i += 1
+            continue
+        if char == "_" and i + 1 < len(src) and src[i + 1] in allowed:
+            i += 2
+            continue
+        break
+    return i
+
+
+def _match_number_fallback(src: str, pos: int = 0) -> _NumberMatchFallback | None:
+    if pos >= len(src):
+        return None
+
+    i = pos
+    signed = False
+    if src[i] in "+-":
+        signed = True
+        i += 1
+        if i >= len(src):
+            return None
+
+    # Non-decimal integers are only valid without a leading sign.
+    if not signed and src.startswith("0x", i):
+        end_pos = _scan_digits_with_underscores(src, i + 2, _HEX_DIGITS)
+        if end_pos is not None:
+            return _NumberMatchFallback(src[pos:end_pos], False, end_pos)
+    if not signed and src.startswith("0o", i):
+        end_pos = _scan_digits_with_underscores(src, i + 2, _OCTAL_DIGITS)
+        if end_pos is not None:
+            return _NumberMatchFallback(src[pos:end_pos], False, end_pos)
+    if not signed and src.startswith("0b", i):
+        end_pos = _scan_digits_with_underscores(src, i + 2, _BINARY_DIGITS)
+        if end_pos is not None:
+            return _NumberMatchFallback(src[pos:end_pos], False, end_pos)
+
+    # Decimal integer part.
+    if src.startswith("0", i):
+        int_end = i + 1
+    elif src[i] in "123456789":
+        scanned = _scan_digits_with_underscores(src, i, _DECIMAL_DIGITS)
+        if scanned is None:
+            return None
+        int_end = scanned
+    else:
+        return None
+
+    end_pos = int_end
+    has_floatpart = False
+
+    # Optional fraction part.
+    if end_pos < len(src) and src[end_pos] == ".":
+        frac_end = _scan_digits_with_underscores(src, end_pos + 1, _DECIMAL_DIGITS)
+        if frac_end is not None:
+            end_pos = frac_end
+            has_floatpart = True
+
+    # Optional exponent part.
+    if end_pos < len(src) and src[end_pos] in "eE":
+        exp_start = end_pos + 1
+        if exp_start < len(src) and src[exp_start] in "+-":
+            exp_start += 1
+        exp_end = _scan_digits_with_underscores(src, exp_start, _DECIMAL_DIGITS)
+        if exp_end is not None:
+            end_pos = exp_end
+            has_floatpart = True
+
+    return _NumberMatchFallback(src[pos:end_pos], has_floatpart, end_pos)
+
+
+class _NumberRegexFallback:
+    def match(self, src: str, pos: int = 0) -> _NumberMatchFallback | None:
+        return _match_number_fallback(src, pos)
+
 
 try:
     _re_number = re.compile(
@@ -57,9 +164,7 @@ try:
     )
 except ValueError:
     _RE_NUMBER_HAS_FLOATPART = False
-    _re_number = re.compile(
-        r"[+-]?(?:0[xX][0-9A-Fa-f]+|0[bB][01]+|0[oO][0-7]+|[0-9]+(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)"
-    )
+    _re_number = _NumberRegexFallback()
 RE_NUMBER: Final = _re_number
 
 try:
@@ -287,11 +392,16 @@ def match_to_localtime(match: Any) -> time:
 
 def match_to_number(match: Any, parse_float: ParseFloat) -> Any:
     num_str = match.group(0)
-    if _RE_NUMBER_HAS_FLOATPART:
-        if match.group("floatpart"):
-            return parse_float(num_str)
-        return int(num_str, 0)
+    try:
+        has_floatpart = bool(match.group("floatpart"))
+    except Exception:
+        has_floatpart = ("." in num_str) or ("e" in num_str) or ("E" in num_str)
 
-    if "." in num_str or "e" in num_str or "E" in num_str:
+    if not _RE_NUMBER_HAS_FLOATPART:
+        # MicroPython numeric constructors may reject underscore separators,
+        # while TOML requires treating underscores as visual separators.
+        num_str = num_str.replace("_", "")
+
+    if has_floatpart:
         return parse_float(num_str)
     return int(num_str, 0)
