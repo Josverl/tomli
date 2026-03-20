@@ -4,7 +4,7 @@ This file tracks currently accepted limitations for the MicroPython port when
 running fixture coverage via:
 
 ```
-micropython tests/micropython/run_subset.py 5000 5000
+micropython tests/micropython/test_micropython.py 5000 5000
 ```
 
 Current status after numeric + datetime/localtime + encoding/comment fixes:
